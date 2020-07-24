@@ -30,85 +30,105 @@ rweSTAN <- function(lst.data, stan.mdl = "powerp",
 
 #' Get Posterior for all stratum
 #'
-#' @param data class DWITHPS data frame
-#' @param type type of outcomes
-#' @param A    target number of subjects to be borrowed
-#' @param RS   parameters for dirichelet prior
-#' @param Fix.RS whether treat RS as fixed or the prior mean of vs
+#' Get Posterior for all stratum ~ getting the result of combining the prior believe with observed data.
+#' Overwriting function in rwetools rwePsPowDrawPost
+#' @param data class data frame individual patient data of one arm (either control or treatment), covariates + endpoint
+#' @param type type of endpoint (continuous, binary)
+#' @param A    target number of subjects to be borrowed from the external data
+#' @param RS   parameters for dirichelet prior (only relevant for binary endpoints)
+#' @param Fix.RS whether treat RS as fixed or the prior mean of vs (only relevant for binary endpoints)
 #' @param ...  extra parameters for calling function \code{\link{rweSTAN}}
 #'
 #' @export
 #'
 rwePsPowDrawPost <- function(data, type = c("continuous", "binary"),
                              A = 0, RS = NULL, Fix.RS = FALSE,
-                             v.outcome = "Y",  ...) {
+                             v.outcome = "Y", chains = 20, ...) {
 
-    stopifnot(v.outcome %in% colnames(data));
-    type <- match.arg(type);
+  stopifnot(v.outcome %in% colnames(data));
+  type <- match.arg(type);
 
-    ## prepare stan data
-    data   <- data[!is.na(data[["_strata_"]]),];
-    S      <- max(data[["_strata_"]]);
-    stan.d <- NULL;
+  ## prepare stan data
+  data    <- data %>% as.data.frame()
+  data   <- data[!is.na(data[["_strata_"]]),];
+  S      <- max(data[["_strata_"]]);
+  stan.d <- NULL;
 
-    Y1     <- NULL;
-    INX1   <- NULL;
-    for (i in 1:S) {
-        cur.d1 <- data[data[["_strata_"]] == i & data[["_grp_"]] == 1, v.outcome];
-        cur.d0 <- data[data[["_strata_"]] == i & data[["_grp_"]] == 0, v.outcome];
+  Y1     <- NULL;
+  INX1   <- NULL;
+  for (i in 1:S) {
 
-        if (0 == length(cur.d1) | 0 == length(cur.d0)) {
-            stop(paste("Stratum ", i, " contains no subjects from group 1 or 0", sep = ""));
-        }
+    # As from paper:
+    ## D0 = external data
+    ## D1 = internal data
+    ## Therefore dataset has to flag internal data as _grp_ == 1 and external data as _grp_ == 0
 
-        cur.n1 <- length(cur.d1);
-        cur.d  <- c(N0 = length(cur.d0), YBAR0 = mean(cur.d0), SD0   = sd(cur.d0),
-                    N1 = cur.n1,         YBAR1 = mean(cur.d1), YSUM1 = sum(cur.d1));
+    cur.d1 <- data[data[["_strata_"]] == i & data[["_grp_"]] == 1, v.outcome];
+    cur.d0 <- data[data[["_strata_"]] == i & data[["_grp_"]] == 0, v.outcome];
 
-        stan.d <- rbind(stan.d, cur.d);
-        Y1     <- c(Y1, cur.d1);
-        INX1   <- c(INX1, rep(i, length = cur.n1));
+    ## It check if have internal and external data in this stratum
+    if (0 == length(cur.d1) | 0 == length(cur.d0)) {
+      stop(paste("Stratum ", i, " contains no subjects from group 1 or 0", sep = ""));
     }
+    ## Describes N in internal data
+    cur.n1 <- length(cur.d1);
+    ## Describes internal and external data
+    cur.d  <- c(N0 = length(cur.d0), YBAR0 = mean(cur.d0), SD0   = sd(cur.d0),
+                N1 = cur.n1,         YBAR1 = mean(cur.d1), YSUM1 = sum(cur.d1));
 
-    if (is.null(RS))
-        RS <- rep(1/S, S);
+    ## Collects description of internal and external data of each stratum
+    stan.d <- rbind(stan.d, cur.d);
+    ## Collects outcomes of internal data of each stratum
+    Y1     <- c(Y1, cur.d1);
+    ## Creates vector repeating stratum name to match previous vector
+    INX1   <- c(INX1, rep(i, length = cur.n1));
+  }
 
-    lst.data  <- list(S     = S,
-                      A     = A,
-                      RS    = RS,
-                      FIXVS = as.numeric(Fix.RS),
-                      N0    = stan.d[,"N0"],
-                      N1    = stan.d[,"N1"],
-                      YBAR0 = stan.d[,"YBAR0"],
-                      SD0   = stan.d[,"SD0"]);
+  if (is.null(RS))
+    RS <- rep(1/S, S);
 
-    ## sampling
-    if ("continuous" == type) {
-        stan.mdl  <- ifelse(1 == S,  "powerp", "powerps");
-        lst.data <- c(lst.data,
-                      list(TN1  = length(Y1),
-                           Y1   = Y1,
-                           INX1 = INX1));
-        rst.post  <- rweSTAN(lst.data = lst.data, stan.mdl = stan.mdl, ...);
-        rst.theta <- rstan::extract(rst.post, pars = "theta")$theta;
+  # Saves to lst.dat prior information and other parameters
+  lst.data  <- list(S     = S,
+                    A     = A,
+                    RS    = RS,
+                    FIXVS = as.numeric(Fix.RS),
+                    N0    = stan.d[,"N0"],
+                    N1    = stan.d[,"N1"],
+                    YBAR0 = stan.d[,"YBAR0"],
+                    SD0   = stan.d[,"SD0"]);
+
+  ## sampling
+  if ("continuous" == type) {
+    stan.mdl  <- ifelse(1 == S,  "powerp", "powerps");
+    # Appends to lst.data internal data outcomes
+    lst.data <- c(lst.data,
+                  list(TN1  = length(Y1),
+                       Y1   = Y1,
+                       INX1 = INX1));
+    # Resamples
+    rst.post  <- rweSTAN(lst.data = lst.data, stan.mdl = stan.mdl, chains = chains, refresh = 0, ...);
+    # Extracts parameters
+    rst.theta <- rstan::extract(rst.post, pars = "theta")$theta;
+  } else {
+    lst.data <- c(lst.data,
+                  list(YBAR1 = as.numeric(stan.d[,"YBAR1"]),
+                       YSUM1 = as.numeric(stan.d[,"YSUM1"])));
+
+    if (1 < S) {
+      rst.post  <- rweSTAN(lst.data = lst.data, stan.mdl = "powerpsbinary", ...);
+      rst.theta <- rstan::extract(rst.post, pars = "theta")$theta;
     } else {
-        lst.data <- c(lst.data,
-                      list(YBAR1 = as.numeric(stan.d[,"YBAR1"]),
-                           YSUM1 = as.numeric(stan.d[,"YSUM1"])));
-
-        if (1 < S) {
-            rst.post  <- rweSTAN(lst.data = lst.data, stan.mdl = "powerpsbinary", ...);
-            rst.theta <- rstan::extract(rst.post, pars = "theta")$theta;
-        } else {
-            rst.post  <- NULL;
-            rst.theta <- with(lst.data, rbeta(2000, YSUM1+A*YBAR0+1, N1-YSUM1+A*(1-YBAR0)+1));
-        }
+      rst.post  <- NULL;
+      rst.theta <- with(lst.data, rbeta(2000, YSUM1+A*YBAR0+1, N1-YSUM1+A*(1-YBAR0)+1));
     }
+  }
 
-    ## return
-    list(post.theta = rst.theta,
-         stan.rst   = rst.post);
+
+  ## return
+  list(post.theta = rst.theta,
+       stan.rst   = rst.post);
 }
+
 
 #' Summary Posterior theta
 #'
